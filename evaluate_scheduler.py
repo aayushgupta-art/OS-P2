@@ -30,7 +30,8 @@ class AdaptiveRoundRobinSimulator:
         # Load the ML model if a path is provided
         self.model = None
         if model_path:
-            self.model = joblib.load("C:/Users/ayush/Downloads/Adaptive_RR_Scheduling (1)_with_dataset/adaptive_quantum_model.pkl")
+            resolved_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path) if not os.path.isabs(model_path) else model_path
+            self.model = joblib.load(resolved_path)
             print("Successfully loaded AI Model into the CPU Simulator.")
 
     def get_queue_features(self):

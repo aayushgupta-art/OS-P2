@@ -1,0 +1,12 @@
+{
+  "held_out_accuracy": 0.6976744186046512,
+  "held_out_mae": 2.0872093023255816,
+  "mean_regret": 0.3756976744186046,
+  "exact_agreement": 0.6976744186046512,
+  "optimal_agreement": 0.6976744186046512,
+  "label_conflict_rate": 0.039962825278810406,
+  "total_records": 1333,
+  "num_workloads": 50,
+  "conflicting_states": 43,
+  "total_unique_states": 1076
+}
