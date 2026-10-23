@@ -4,6 +4,8 @@ Implements F1-F9 improvements over the previous version.
 """
 
 import os
+import sys
+import traceback
 import joblib
 import numpy as np
 import pandas as pd
@@ -14,9 +16,6 @@ import importlib
 import metrics
 import round_robin
 import features
-importlib.reload(metrics)
-importlib.reload(round_robin)
-importlib.reload(features)
 
 from process import Process
 from round_robin import RoundRobinSimulator, FixedQuantumPolicy, AdaptiveQuantumPolicy
@@ -25,7 +24,7 @@ from metrics import (
     compute_metrics, format_process_table, METRIC_COLUMNS, METRICS_CAPTION,
     reference_round_robin,
 )
-from create_training_data import evaluate_candidate_costs
+from create_training_data import evaluate_candidate_costs, find_candidate_match
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "adaptive_quantum_model.pkl")
@@ -37,47 +36,69 @@ CS_COLOR   = "#f59e0b"
 IDLE_COLOR = "#64748b"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cached loaders
+# Cached loaders (safe against startup crashes on cloud environments)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
+    """
+    Safely load the trained machine learning model.
+    If missing or corrupted, retrain automatically from training_data.csv.
+    """
     if not os.path.exists(MODEL_PATH):
         try:
             from train_model import train_and_evaluate
             st.info("Adaptive quantum model not found. Automatically training model from training_data.csv...")
             train_and_evaluate()
         except Exception as e:
-            raise FileNotFoundError(f"Model not found at {MODEL_PATH} and auto-training failed: {e}")
+            st.error(f"🚨 Failed to automatically train adaptive model: {e}")
+            st.code(traceback.format_exc())
+            return None
+
     try:
         mdl = joblib.load(MODEL_PATH)
         verify_feature_names(mdl)
         return mdl
     except Exception as e:
+        st.warning(f"Failed to load cached model ({e}). Retraining model with local environment...")
         try:
             from train_model import train_and_evaluate
-            st.warning(f"Failed to load cached model ({e}). Retraining with local environment...")
             train_and_evaluate()
             mdl = joblib.load(MODEL_PATH)
             verify_feature_names(mdl)
             return mdl
         except Exception as err:
-            raise RuntimeError(f"Error loading and retraining model: {err}")
+            st.error(f"🚨 Critical Startup Error loading adaptive quantum model: {err}")
+            st.code(traceback.format_exc())
+            return None
 
 
 @st.cache_data
 def load_training_data():
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(f"Training data not found at {DATA_PATH}.")
-    return pd.read_csv(DATA_PATH)
+    """Safely load the training dataset CSV with traceback display on error."""
+    try:
+        if not os.path.exists(DATA_PATH):
+            st.error(f"🚨 Training data CSV not found at {DATA_PATH}.")
+            return None
+        return pd.read_csv(DATA_PATH)
+    except Exception as e:
+        st.error(f"🚨 Critical Startup Error loading training dataset: {e}")
+        st.code(traceback.format_exc())
+        return None
 
 
 @st.cache_data
 def load_experiment_results():
-    p1_path = os.path.join(RESULTS_DIR, "phase1_fixed_quantum_sweep.csv")
-    p2_path = os.path.join(RESULTS_DIR, "phase2_adaptive_vs_fixed.csv")
-    p1_df = pd.read_csv(p1_path) if os.path.exists(p1_path) else None
-    p2_df = pd.read_csv(p2_path) if os.path.exists(p2_path) else None
-    return p1_df, p2_df
+    """Safely load Phase 1 and Phase 2 benchmark results with traceback on error."""
+    try:
+        p1_path = os.path.join(RESULTS_DIR, "phase1_fixed_quantum_sweep.csv")
+        p2_path = os.path.join(RESULTS_DIR, "phase2_adaptive_vs_fixed.csv")
+        p1_df = pd.read_csv(p1_path) if os.path.exists(p1_path) else None
+        p2_df = pd.read_csv(p2_path) if os.path.exists(p2_path) else None
+        return p1_df, p2_df
+    except Exception as e:
+        st.error(f"🚨 Critical Startup Error reading CSV experiment results: {e}")
+        st.code(traceback.format_exc())
+        return None, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -736,22 +757,61 @@ active_scheduler = st.radio(
 # Main content
 # ─────────────────────────────────────────────────────────────────────────────
 if process_list and not custom_parse_error:
-    model = load_model()
-    adaptive_policy = AdaptiveQuantumPolicy(model)
-    fixed_policy    = FixedQuantumPolicy(quantum)
+    try:
+        model = load_model()
+    except Exception as e:
+        st.error(f"🚨 Failed in load_model: {e}")
+        st.code(traceback.format_exc())
+        model = None
 
-    baseline_metrics = simulate_schedule(process_list, fixed_policy, context_penalty, is_ai=False, fixed_q=quantum)
-    adaptive_metrics = simulate_schedule(process_list, adaptive_policy, context_penalty, is_ai=True)
+    if model is not None:
+        try:
+            adaptive_policy = AdaptiveQuantumPolicy(model)
+        except Exception as e:
+            st.error(f"🚨 Failed to initialize AdaptiveQuantumPolicy: {e}")
+            st.code(traceback.format_exc())
+            adaptive_policy = None
+    else:
+        adaptive_policy = None
 
-    initial_feats = extract_features(process_list, [])
-    initial_predicted_quantum = adaptive_policy({"ready_queue": list(process_list), "recent_history": []})
+    fixed_policy = FixedQuantumPolicy(quantum)
+
+    try:
+        baseline_metrics = simulate_schedule(process_list, fixed_policy, context_penalty, is_ai=False, fixed_q=quantum)
+    except Exception as e:
+        st.error(f"🚨 Critical Error simulating baseline schedule: {e}")
+        st.code(traceback.format_exc())
+        baseline_metrics = None
+
+    adaptive_metrics = None
+    if adaptive_policy is not None:
+        try:
+            adaptive_metrics = simulate_schedule(process_list, adaptive_policy, context_penalty, is_ai=True)
+        except Exception as e:
+            st.error(f"🚨 Critical Error simulating adaptive schedule: {e}")
+            st.code(traceback.format_exc())
+            adaptive_metrics = None
+    else:
+        adaptive_metrics = baseline_metrics
+
+    try:
+        initial_feats = extract_features(process_list, [])
+        initial_predicted_quantum = (
+            adaptive_policy({"ready_queue": list(process_list), "recent_history": []})
+            if adaptive_policy is not None else quantum
+        )
+    except Exception as e:
+        st.error(f"🚨 Error extracting initial workload features: {e}")
+        st.code(traceback.format_exc())
+        initial_feats = {"ready_queue_length": len(process_list), "average_cpu_burst": 0.0, "recent_workload_behavior": 0.0}
+        initial_predicted_quantum = quantum
 
     # ── G2: Two clearly labelled groups for header ───────────────────────────
     total_burst = sum(p.burst_time for p in process_list)
     avg_burst = initial_feats["average_cpu_burst"]
     num_procs = len(process_list)
 
-    curr_metrics_hdr = adaptive_metrics if active_scheduler == "AI-Adaptive Scheduler" else baseline_metrics
+    curr_metrics_hdr = adaptive_metrics if active_scheduler == "AI-Adaptive Scheduler" and adaptive_metrics is not None else baseline_metrics
     curr_tl_hdr = curr_metrics_hdr["timeline"]
     sk_hdr = f"sel_ev_{active_scheduler}"
     sel_idx_hdr = st.session_state.get(sk_hdr, 0)
@@ -1652,7 +1712,15 @@ if process_list and not custom_parse_error:
             "average_cpu_burst": avg_b,
             "recent_workload_behavior": rec_beh,
         }])
-        model_pred = int(max(1, min(20, round(float(model.predict(vec_df)[0])))))
+        if model is not None:
+            try:
+                model_pred = int(max(1, min(20, round(float(model.predict(vec_df)[0])))))
+            except Exception as e:
+                st.error(f"🚨 Error during model prediction: {e}")
+                st.code(traceback.format_exc())
+                model_pred = quantum
+        else:
+            model_pred = quantum
 
         st.subheader(f"AI Prediction Pipeline: Event {disp_num}, {disp_pid}, t={disp_time}")
 
@@ -1736,46 +1804,53 @@ if process_list and not custom_parse_error:
                 rq_procs[idx_p].start_time = p_snap[3]
                 rq_procs[idx_p].response_time = p_snap[4]
 
-            cand_table, best_q, min_cost, is_tied = evaluate_candidate_costs(
-                rq_procs, disp_ev["start"], penalty=context_penalty
-            )
-            true_min_item = min(cand_table, key=lambda x: x["cost"])
-            true_min_q = true_min_item["quantum"]
-            true_min_cost = true_min_item["cost"]
+            try:
+                cand_table, best_q, min_cost, is_tied = evaluate_candidate_costs(
+                    rq_procs, disp_ev["start"], penalty=context_penalty
+                )
+            except Exception as e:
+                st.error(f"🚨 Error evaluating candidate lookahead costs: {e}")
+                st.code(traceback.format_exc())
+                cand_table = []
 
-            best_item = next((r for r in cand_table if r.get("is_best")), cand_table[0])
-            best_cost = best_item["cost"]
+            if cand_table:
+                true_min_item = min(cand_table, key=lambda x: x["cost"])
+                true_min_q = true_min_item["quantum"]
+                true_min_cost = true_min_item["cost"]
 
-            matched_pred = find_candidate_match(cand_table, model_pred)
-            pred_cost = matched_pred["cost"] if matched_pred else best_cost
-            regret = max(0.0, pred_cost - best_cost)
+                best_item = next((r for r in cand_table if r.get("is_best")), cand_table[0])
+                best_cost = best_item["cost"]
 
-            cand_rows = []
-            has_notes = any(r.get("note") for r in cand_table)
-            for r in cand_table:
-                is_chosen = (r is matched_pred)
-                is_best_tie = r.get("is_best", False)
-                is_true_min = r.get("is_true_min", False)
+                matched_pred = find_candidate_match(cand_table, model_pred)
+                pred_cost = matched_pred["cost"] if matched_pred else best_cost
+                regret = max(0.0, pred_cost - best_cost)
 
-                status_parts = []
-                if is_best_tie:
-                    status_parts.append("⭐ Best (tie-break)")
-                elif is_true_min:
-                    status_parts.append("✓ Min cost")
-                if is_chosen:
-                    status_parts.append("(AI Predicted)")
+                cand_rows = []
+                has_notes = any(r.get("note") for r in cand_table)
+                for r in cand_table:
+                    is_chosen = (r is matched_pred)
+                    is_best_tie = r.get("is_best", False)
+                    is_true_min = r.get("is_true_min", False)
 
-                row_dict = {
-                    "Candidate Quantum": r["label"],
-                    "Lookahead Cost": f"{r['cost']:.2f}",
-                    "Status": " ".join(status_parts),
-                }
-                if has_notes:
-                    row_dict["Note"] = r.get("note", "")
-                cand_rows.append(row_dict)
+                    status_parts = []
+                    if is_best_tie:
+                        status_parts.append("⭐ Best (tie-break)")
+                    elif is_true_min:
+                        status_parts.append("✓ Min cost")
+                    if is_chosen:
+                        status_parts.append("(AI Predicted)")
 
-            cand_df = pd.DataFrame(cand_rows)
-            render_html_table(cand_df, light_mode=light_mode)
+                    row_dict = {
+                        "Candidate Quantum": r["label"],
+                        "Lookahead Cost": f"{r['cost']:.2f}",
+                        "Status": " ".join(status_parts),
+                    }
+                    if has_notes:
+                        row_dict["Note"] = r.get("note", "")
+                    cand_rows.append(row_dict)
+
+                cand_df = pd.DataFrame(cand_rows)
+                render_html_table(cand_df, light_mode=light_mode)
 
             st.markdown(
                 f"**True Minimum Lookahead Cost:** `{true_min_cost:.2f}` at **Q = {true_min_q}**"
@@ -1807,28 +1882,35 @@ if process_list and not custom_parse_error:
             "Average CPU Burst of Ready Queue",
             "Ready Queue Length (Process count)",
         ]
-        feat_vals = [
-            model.feature_importances_[2],
-            model.feature_importances_[1],
-            model.feature_importances_[0],
-        ]
-        fi_fig = go.Figure(go.Bar(
-            x=feat_vals,
-            y=feat_display_names,
-            orientation="h",
-            marker_color="#31c48d",
-            text=[f"{v:.1%}" for v in feat_vals],
-            textposition="auto",
-        ))
-        fi_fig.update_layout(
-            height=200,
-            margin=dict(l=20, r=20, t=20, b=35),
-            xaxis=dict(title="Importance", range=[0, max(feat_vals) * 1.25]),
-            paper_bgcolor="#ffffff" if light_mode else "#0b1220",
-            plot_bgcolor="#ffffff" if light_mode else "#0b1220",
-            font=dict(color="#172033" if light_mode else "#e2e8f0"),
-        )
-        st.plotly_chart(fi_fig, use_container_width=True)
+        if model is not None and hasattr(model, "feature_importances_"):
+            try:
+                feat_vals = [
+                    model.feature_importances_[2],
+                    model.feature_importances_[1],
+                    model.feature_importances_[0],
+                ]
+                fi_fig = go.Figure(go.Bar(
+                    x=feat_vals,
+                    y=feat_display_names,
+                    orientation="h",
+                    marker_color="#31c48d",
+                    text=[f"{v:.1%}" for v in feat_vals],
+                    textposition="auto",
+                ))
+                fi_fig.update_layout(
+                    height=200,
+                    margin=dict(l=20, r=20, t=20, b=35),
+                    xaxis=dict(title="Importance", range=[0, max(feat_vals) * 1.25]),
+                    paper_bgcolor="#ffffff" if light_mode else "#0b1220",
+                    plot_bgcolor="#ffffff" if light_mode else "#0b1220",
+                    font=dict(color="#172033" if light_mode else "#e2e8f0"),
+                )
+                st.plotly_chart(fi_fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"🚨 Error rendering feature importance chart: {e}")
+                st.code(traceback.format_exc())
+        else:
+            st.info("Feature importance display is currently unavailable (model not loaded).")
 
         # ── G7: Training Dataset Insights & Hold-Out Validation ──────────────
         st.subheader("Training Dataset Insights & Hold-Out Validation")
@@ -1856,44 +1938,51 @@ if process_list and not custom_parse_error:
         st.caption(f"Evaluated across {h_rec} split strictly by workload.")
 
         training_df = load_training_data()
-        lbl_dist = training_df["optimal_quantum"].value_counts().sort_index()
+        if training_df is not None:
+            try:
+                lbl_dist = training_df["optimal_quantum"].value_counts().sort_index()
 
-        hist_fig = go.Figure(go.Bar(
-            x=[str(q) for q in lbl_dist.index],
-            y=lbl_dist.values,
-            marker_color="#38bdf8",
-            text=lbl_dist.values,
-            textposition="outside",
-        ))
-        hist_fig.update_layout(
-            height=260,
-            margin=dict(l=40, r=20, t=30, b=45),
-            xaxis=dict(title="Optimal quantum", type="category"),
-            yaxis=dict(title="Records", range=[0, max(lbl_dist.values) * 1.15]),
-            paper_bgcolor="#ffffff" if light_mode else "#0b1220",
-            plot_bgcolor="#ffffff" if light_mode else "#0b1220",
-            font=dict(color="#172033" if light_mode else "#e2e8f0"),
-        )
-        st.plotly_chart(hist_fig, use_container_width=True)
+                hist_fig = go.Figure(go.Bar(
+                    x=[str(q) for q in lbl_dist.index],
+                    y=lbl_dist.values,
+                    marker_color="#38bdf8",
+                    text=lbl_dist.values,
+                    textposition="outside",
+                ))
+                hist_fig.update_layout(
+                    height=260,
+                    margin=dict(l=40, r=20, t=30, b=45),
+                    xaxis=dict(title="Optimal quantum", type="category"),
+                    yaxis=dict(title="Records", range=[0, max(lbl_dist.values) * 1.15]),
+                    paper_bgcolor="#ffffff" if light_mode else "#0b1220",
+                    plot_bgcolor="#ffffff" if light_mode else "#0b1220",
+                    font=dict(color="#172033" if light_mode else "#e2e8f0"),
+                )
+                st.plotly_chart(hist_fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"🚨 Error generating label distribution chart: {e}")
+                st.code(traceback.format_exc())
 
-        st.info(
-            "**Why ~56% of training labels are Q=1 or Q=20:**\n\n"
-            "1. **Lone-process and indifferent states:** When only 1 process is in the ready queue or remaining burst is small, "
-            "multiple candidate quanta produce identical cost. Because candidate quanta are evaluated in increasing order (1, 2, 3...), "
-            "Q=1 wins strict `<` tie-breaks during lookahead cost minimization.\n"
-            "2. **Switch-minimization polarization:** For heavy CPU bursts, Q=20 maximally suppresses preemption churn and context-switch "
-            "penalties, achieving lowest total lookahead cost.\n"
-            "3. **Penalty Parameter Calibration:** While the model predicts quanta from the 3 workload features calibrated at penalty=1, "
-            "evaluating context-switch penalty as an explicit parameter shows that separate penalty calibration improves held-out accuracy "
-            "from 64.7% to 71.9%."
-        )
+            st.info(
+                "**Why ~56% of training labels are Q=1 or Q=20:**\n\n"
+                "1. **Lone-process and indifferent states:** When only 1 process is in the ready queue or remaining burst is small, "
+                "multiple candidate quanta produce identical cost. Because candidate quanta are evaluated in increasing order (1, 2, 3...), "
+                "Q=1 wins strict `<` tie-breaks during lookahead cost minimization.\n"
+                "2. **Switch-minimization polarization:** For heavy CPU bursts, Q=20 maximally suppresses preemption churn and context-switch "
+                "penalties, achieving lowest total lookahead cost.\n"
+                "3. **Penalty Parameter Calibration:** While the model predicts quanta from the 3 workload features calibrated at penalty=1, "
+                "evaluating context-switch penalty as an explicit parameter shows that separate penalty calibration improves held-out accuracy "
+                "from 64.7% to 71.9%."
+            )
 
-        st.dataframe(training_df.head(15).astype(str), width="content", hide_index=True)
-        st.download_button(
-            "⬇ Download training dataset (CSV)",
-            data=training_df.to_csv(index=False).encode("utf-8"),
-            file_name="training_data.csv", mime="text/csv",
-        )
+            st.dataframe(training_df.head(15).astype(str), width="content", hide_index=True)
+            st.download_button(
+                "⬇ Download training dataset (CSV)",
+                data=training_df.to_csv(index=False).encode("utf-8"),
+                file_name="training_data.csv", mime="text/csv",
+            )
+        else:
+            st.warning("⚠️ Training dataset is currently unavailable.")
 
     # =========================================================================
     # TAB 4 – Phase 1 sweep

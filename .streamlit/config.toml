@@ -2,5 +2,4 @@
 gatherUsageStats = false
 
 [server]
-port = 8503
 headless = true
